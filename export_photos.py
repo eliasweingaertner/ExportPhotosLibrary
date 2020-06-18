@@ -272,7 +272,10 @@ def copyPhoto(row, destinationSubDir):
     # Copy the file if it doesn't exist already.
     if not os.path.isfile(destinationFile):
         if not args.dryrun:
-            shutil.copy(sourceImageFile, destinationFile)
+            try:
+                shutil.copy(sourceImageFile, destinationFile)
+            except:
+                print("Error with copying file %s" % destinationFile)
         if args.verbose:
             print ("Copied as %s" % destinationFile)
         return (destinationFile, 1)
