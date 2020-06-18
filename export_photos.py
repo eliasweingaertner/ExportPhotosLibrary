@@ -11,6 +11,7 @@ from errno import EEXIST
 from exiftool import ExifTool, fsencode
 from signal import signal, SIGINT
 from tempfile import mkdtemp
+from pathvalidate import sanitize_filename
 
 # Command line arguments.
 parser = argparse.ArgumentParser(description = 'Exports the contents of a Photos.app library to date-based directories.', formatter_class = argparse.ArgumentDefaultsHelpFormatter)
@@ -21,6 +22,8 @@ parser.add_argument('-e', '--exif', default = True, help = "set EXIF date inform
 parser.add_argument('-f', '--faces', default = True, help = "set faces information in EXIF comment for JPEG files.", action = "store_true")
 parser.add_argument('-l', '--location', default = True, help = "append location to directory names.", action = "store_true")
 parser.add_argument('-r', '--region', default = False, help = "prepend region information to locations.", action = "store_true")
+parser.add_argument('-a', '--album', default = False, help = "Add Album Information to XMP and directory name", action = "store_true")
+parser.add_argument('-apdb','--apdbDir', default = False, help ="Prepend db directory with apdb for super-old Photos, eg. Mac OS Yosemite", action = "store_true")
 
 group = parser.add_mutually_exclusive_group()
 group.add_argument('-p', '--progress', default = True, help = "show a bar indicating the completion of the copying progress", action = "store_true")
@@ -49,9 +52,14 @@ if not os.path.isdir(destinationRoot):
     sys.exit(-1)
 
 # Determine the database directory, in case we're using a case-sensitive FS. (Older libraries have a capitalised directory name.)
-databaseDir = os.path.join(libraryRoot, 'database')
+
+suffix=""
+if args.apdbDir:
+    suffix="apdb"
+
+databaseDir = os.path.join(libraryRoot, 'database/'+suffix)
 if not os.path.isdir(databaseDir):
-    databaseDir = os.path.join(libraryRoot, 'Database')
+    databaseDir = os.path.join(libraryRoot, 'Database/'+suffix)
 
 # Are we dealing with an Aperture, iPhoto, or pre-Sierra style Photos library?
 isLegacyLibrary = os.path.isfile(os.path.join(databaseDir, 'Library.apdb'))
@@ -103,6 +111,7 @@ db.execute('''
 numImages = db.fetchone()[0]
 print ("Found %d images." % numImages)
 
+
 # Are we exporting faces?
 if args.faces:
     if isLegacyLibrary:
@@ -136,6 +145,24 @@ if args.location:
     pdb.execute("SELECT COUNT(*) FROM RKPlace")
     numPlaces = pdb.fetchone()[0];
     print ("Found %d places." % numPlaces)
+
+if args.album:
+    db.execute('''
+        SELECT f.name, f.uuid
+        FROM RKFolder AS f''')
+
+    arows = db.fetchall()
+
+    uuIdAlbum={}
+
+    for row in arows:
+        uuid=row["uuid"]
+        albumName=row["name"]
+        uuIdAlbum[uuid]=albumName;
+
+    print("Found %d albums" % len(uuIdAlbum))
+    if args.verbose:
+        print("Albums found:", uuIdAlbum)
 
 # No images?
 if numImages == 0:
@@ -184,7 +211,6 @@ def facesByUuid(uuId):
     faces = fdb.fetchall()
     return [f["name"] for f in faces]
 
-
 def currentDateInExif(fileName):
     currentExif = et.get_tags(("EXIF:DateTimeOriginal", "EXIF:CreateDate"), fileName)
     if 'EXIF:CreateDate' in currentExif:
@@ -202,6 +228,10 @@ def setDateInExif(fileName, formattedDate):
 
 def setOrientationInExif(fileName, orientation):
     cmd = map(fsencode, ['-EXIF:Orientation=%s' % orientation, '-n', '-overwrite_original', fileName])
+    et.execute(*cmd)
+
+def setAlbumInXmp(fileName, albumName):
+    cmd = map(fsencode, ['-xmp:album=%s' % albumName, '-n', '-overwrite_original', fileName])
     et.execute(*cmd)
 
 
@@ -223,7 +253,17 @@ def ensureDirExists(path):
 
 def copyPhoto(row, destinationSubDir):
     # Get ready to copy the file.
-    destinationDir = os.path.join(destinationRoot, destinationSubDir)
+
+    subDir = destinationSubDir
+
+    if args.album:
+        folderUuid=row["projectUUid"];
+        if folderUuid in uuIdAlbum:
+            albumName = uuIdAlbum[row["projectUUid"]]
+            if albumName:
+                subDir = os.path.join(sanitize_filename(albumName),destinationSubDir)
+
+    destinationDir = os.path.join(destinationRoot, subDir)
     destinationFile = os.path.join(destinationDir, row["fileName"])
     sourceImageFile = os.path.join(libraryRoot, "Masters", row["imagePath"])
     if not args.dryrun:
@@ -245,35 +285,37 @@ def copyPhoto(row, destinationSubDir):
 
 # TODO: merge calls to exiftool.
 def postProcessPhoto(fileName, row):
-    extension = os.path.splitext(row["fileName"])[1].lower()
-    if not (extension == '.jpg' or extension == '.jpeg'):
-        return
+    try:
+        extension = os.path.splitext(row["fileName"])[1].lower()
+        if not (extension == '.jpg' or extension == '.jpeg'):
+            return
 
-    # Figure out what date is currently set in the image, and whether this matches the database.
-    compareDate = currentDateInExif(fileName)
-    desiredDate = photoTimestamp(row).strftime("%Y:%m:%d %H:%M:%S")
+        # Figure out what date is currently set in the image, and whether this matches the database.
+        compareDate = currentDateInExif(fileName)
+        desiredDate = photoTimestamp(row).strftime("%Y:%m:%d %H:%M:%S")
 
-    # Do we need to set a date ourselves?
-    if compareDate != desiredDate:
-        if args.verbose:
-            print ("> EXIF date '%s' will be replaced with '%s'" % (compareDate, desiredDate))
+        # Do we need to set a date ourselves?
+        if compareDate != desiredDate:
+            if args.verbose:
+                print ("> EXIF date '%s' will be replaced with '%s'" % (compareDate, desiredDate))
 
+            if not args.dryrun:
+                setDateInExif(fileName, desiredDate)
+
+        # Set faces as EXIF keywords.
+        if args.faces:
+            faces = facesByUuid(row["uuid"])
+            if len(faces) and args.verbose:
+                print ("> Faces:", ', '.join([face for face in faces]))
+
+            if not args.dryrun:
+                setExifKeywords(fileName, faces)
+
+        # Set orientation in EXIF.
         if not args.dryrun:
-            setDateInExif(fileName, desiredDate)
-
-    # Set faces as EXIF keywords.
-    if args.faces:
-        faces = facesByUuid(row["uuid"])
-        if len(faces) and args.verbose:
-            print ("> Faces:", ', '.join([face for face in faces]))
-
-        if not args.dryrun:
-            setExifKeywords(fileName, faces)
-
-    # Set orientation in EXIF.
-    if not args.dryrun:
-        setOrientationInExif(fileName, row["orientation"])
-
+            setOrientationInExif(fileName, row["orientation"])
+    except:
+        print("ERROR while post-processing file %s", fileName)
 
 # Shows a helpful progress bar.
 def showProgressBar(total, completed):
@@ -355,7 +397,7 @@ def processStack():
 
 # Iterate over the photos.
 for row in db.execute('''
-    SELECT m.imagePath, m.fileName, v.imageDate AS date, v.imageTimeZoneOffsetSeconds AS offset,
+    SELECT m.imagePath, m.fileName, m.projectUUid, v.imageDate AS date, v.imageTimeZoneOffsetSeconds AS offset,
         v.uuid, v.modelId, v.orientation
     FROM RKMaster AS m
     INNER JOIN RKVersion AS v ON v.masterId = m.modelId
