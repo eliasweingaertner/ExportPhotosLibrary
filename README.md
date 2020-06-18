@@ -1,4 +1,4 @@
-#What is this?
+# What is this?
 
 This Python script exports images from the Photos App in Mac OS X. It works also with really old Photos Apps like in Mac OS X Yosemite (10.10). It runs on Linux. It does not require any Apple artifacts on the system.
 
